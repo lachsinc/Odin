@@ -461,9 +461,12 @@ AST_NODE_KIND(_TypeBegin, "", struct {}) \
 	}) \
 	AST_NODE_KIND(MapType, "map type", struct { \
 		Token    token; \
-		AstNode *count; \
 		AstNode *key; \
 		AstNode *value; \
+	}) \
+	AST_NODE_KIND(SetType, "set type", struct { \
+		Token    token; \
+		AstNode *key; \
 	}) \
 AST_NODE_KIND(_TypeEnd,  "", struct {})
 

@@ -20,6 +20,7 @@ when ODIN_OS == "windows" {
 	import win32 "core:sys/windows.odin"
 }
 
+
 @(link_name="general_stuff")
 general_stuff :: proc() {
 	fmt.println("# general_stuff");
@@ -793,7 +794,7 @@ deprecated_attribute :: proc() {
 
 
 main :: proc() {
-	when true {
+	when false {
 		general_stuff();
 		default_struct_values();
 		union_type();

@@ -92,6 +92,7 @@ Token ast_node_token(AstNode *node) {
 	case AstNode_EnumType:         return node->EnumType.token;
 	case AstNode_BitFieldType:     return node->BitFieldType.token;
 	case AstNode_MapType:          return node->MapType.token;
+	case AstNode_SetType:          return node->SetType.token;
 	}
 
 	return empty_token;
@@ -355,9 +356,11 @@ AstNode *clone_ast_node(gbAllocator a, AstNode *node) {
 		n->BitFieldType.fields = clone_ast_node_array(a, n->BitFieldType.fields);
 		n->BitFieldType.align = clone_ast_node(a, n->BitFieldType.align);
 	case AstNode_MapType:
-		n->MapType.count = clone_ast_node(a, n->MapType.count);
 		n->MapType.key   = clone_ast_node(a, n->MapType.key);
 		n->MapType.value = clone_ast_node(a, n->MapType.value);
+		break;
+	case AstNode_SetType:
+		n->SetType.key   = clone_ast_node(a, n->SetType.key);
 		break;
 	}
 
@@ -414,7 +417,7 @@ bool ast_node_expect(AstNode *node, AstNodeKind kind) {
 // NOTE(bill): And this below is why is I/we need a new language! Discriminated unions are a pain in C/C++
 AstNode *make_ast_node(AstFile *f, AstNodeKind kind) {
 	gbArena *arena = &f->arena;
-	if (gb_arena_size_remaining(arena, GB_DEFAULT_MEMORY_ALIGNMENT) <= gb_size_of(AstNode)) {
+	if (gb_arena_size_remaining(arena, GB_DEFAULT_MEMORY_ALIGNMENT) <= 2*gb_size_of(AstNode)) {
 		// NOTE(bill): If a syntax error is so bad, just quit!
 		gb_exit(1);
 	}
@@ -953,6 +956,14 @@ AstNode *ast_map_type(AstFile *f, Token token, AstNode *key, AstNode *value) {
 	result->MapType.value = value;
 	return result;
 }
+
+AstNode *ast_set_type(AstFile *f, Token token, AstNode *key) {
+	AstNode *result = make_ast_node(f, AstNode_SetType);
+	result->SetType.token = token;
+	result->SetType.key   = key;
+	return result;
+}
+
 
 
 AstNode *ast_foreign_block_decl(AstFile *f, Token token, AstNode *foreign_library, Token open, Token close, Array<AstNode *> decls,
@@ -1821,11 +1832,23 @@ AstNode *parse_operand(AstFile *f, bool lhs) {
 		Token open, close;
 
 		open  = expect_token_after(f, Token_OpenBracket, "map");
-		key   = parse_expr(f, true);
+		key   = parse_type(f);
 		close = expect_token(f, Token_CloseBracket);
 		value = parse_type(f);
 
 		return ast_map_type(f, token, key, value);
+	} break;
+
+	case Token_set: {
+		Token token = expect_token(f, Token_set);
+		AstNode *key   = nullptr;
+		Token open, close;
+
+		open  = expect_token_after(f, Token_OpenBracket, "set");
+		key   = parse_type(f);
+		close = expect_token(f, Token_CloseBracket);
+
+		return ast_set_type(f, token, key);
 	} break;
 
 	case Token_struct: {

@@ -8,8 +8,8 @@ foreign __llvm_core {
 swap :: proc[swap16, swap32, swap64];
 
 
-set :: proc "contextless" (data: rawptr, value: i32, len: int) -> rawptr {
-	return __mem_set(data, value, len);
+set_bytes :: proc "contextless" (data: rawptr, value: byte, len: int) -> rawptr {
+	return __mem_set(data, i32(value), len);
 }
 zero :: proc "contextless" (data: rawptr, len: int) -> rawptr {
 	return __mem_zero(data, len);
