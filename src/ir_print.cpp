@@ -231,27 +231,29 @@ bool ir_print_debug_location(irFileBuffer *f, irModule *m, irValue *v, irProcedu
 		// and continues to exhibit bad stepping behabiour, but now should occur much less often
 		// thanks to above. The proper fix is to, in ir.cpp, set valid loc for all irValues that require
 		// it.
-		if (v->kind == irValue_Instr && v->Instr.kind == irInstr_Call) {
-			irInstrCall *call = &v->Instr.Call;
-			irDebugInfo *di_scope = nullptr;
-			if (proc) {
-				if (proc->debug_scope) {
-					di_scope = proc->debug_scope;
+		if (v->kind == irValue_Instr) {
+			if (v->Instr.kind == irInstr_Call) {
+				irInstrCall *call = &v->Instr.Call;
+				irDebugInfo *di_scope = nullptr;
+				if (proc) {
+					if (proc->debug_scope) {
+						di_scope = proc->debug_scope;
+					}
 				}
-			}
-			if (di_scope == nullptr) {
-				if (call->value->kind == irValue_Proc && call->value->Proc.debug_scope) {
-					di_scope = call->value->Proc.debug_scope;
+				if (di_scope == nullptr) {
+					if (call->value->kind == irValue_Proc && call->value->Proc.debug_scope) {
+						di_scope = call->value->Proc.debug_scope;
+					}
 				}
+				if (di_scope) {
+					ir_fprintf(f, ", !dbg !DILocation(line: %td, column: %td, scope: !%d)",
+					           di_scope->Proc.pos.line,
+					           di_scope->Proc.pos.column,
+					           di_scope->id);
+					return true;
+				}
+				GB_PANIC("Inlinable call instr in a debuggable proc must have !dbg metadata attachment");
 			}
-			if (di_scope) {
-				ir_fprintf(f, ", !dbg !DILocation(line: %td, column: %td, scope: !%d)",
-				           di_scope->Proc.pos.line,
-				           di_scope->Proc.pos.column,
-				           di_scope->id);
-				return true;
-			}
-			GB_PANIC("Inlinable call instr in a debuggable proc must have !dbg metadata attachment");
 		}
 	}
 	return false;
