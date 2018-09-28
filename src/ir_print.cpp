@@ -214,6 +214,48 @@ void ir_print_encoded_global(irFileBuffer *f, String name, bool remove_prefix) {
 
 bool ir_print_debug_location(irFileBuffer *f, irModule *m, irValue *v, irProcedure *proc = nullptr) {
 #if 1
+	if (m->generate_debug_info) {
+		GB_ASSERT_NOT_NULL(v);
+		if (v->loc) {
+			// Update curr_debug_loc
+			m->curr_debug_loc = v->loc;
+		}
+		if (m->curr_debug_loc != nullptr) {
+			GB_ASSERT(m->curr_debug_loc->kind == irDebugInfo_Location);
+			ir_fprintf(f, ", !dbg !%d", m->curr_debug_loc->id);
+			return true;
+		}
+		// TODO(lachsinc): HACK HACK HACK
+		// For now, since inlinable call instructions _require_ a valid !dbg attachment. If there is no valid
+		// we just set to first line of the containing procedure (like before). This is not great,
+		// and continues to exhibit bad stepping behabiour, but now should occur much less often
+		// thanks to above. The proper fix is to, in ir.cpp, set valid loc for all irValues that require
+		// it.
+		if (v->kind == irValue_Instr && v->Instr.kind == irInstr_Call) {
+			irInstrCall *call = &v->Instr.Call;
+			irDebugInfo *di_scope = nullptr;
+			if (proc) {
+				if (proc->debug_scope) {
+					di_scope = proc->debug_scope;
+				}
+			}
+			if (di_scope == nullptr) {
+				if (call->value->kind == irValue_Proc && call->value->Proc.debug_scope) {
+					di_scope = call->value->Proc.debug_scope;
+				}
+			}
+			if (di_scope) {
+				ir_fprintf(f, ", !dbg !DILocation(line: %td, column: %td, scope: !%d)",
+				           di_scope->Proc.pos.line,
+				           di_scope->Proc.pos.column,
+				           di_scope->id);
+				return true;
+			}
+			GB_PANIC("Inlinable call instr in a debuggable proc must have !dbg metadata attachment");
+		}
+	}
+	return false;
+#elif 0
 	if (m->generate_debug_info && v != nullptr) {
 		TokenPos pos = v->loc.pos;
 		irDebugInfo *scope = v->loc.debug_scope;
@@ -227,7 +269,7 @@ bool ir_print_debug_location(irFileBuffer *f, irModule *m, irValue *v, irProcedu
 			}
 		}
 		if (id > 0 && pos.line > 0) {
-			ir_fprintf(f, ", !dbg !DILocation(line: %td, column: %td, scope: !%d)", pos.line, pos.column, id);
+			// ir_fprintf(f, ", !dbg !DILocation(line: %td, column: %td, scope: !%d)", pos.line, pos.column, id);
 			return true;
 		}
 	}
@@ -1516,6 +1558,10 @@ void ir_print_instr(irFileBuffer *f, irModule *m, irValue *value) {
 		case ProcInlining_inline:    ir_write_str_lit(f, " alwaysinline"); break;
 		case ProcInlining_no_inline: ir_write_str_lit(f, " noinline");     break;
 		}
+		// TODO(lachsinc): I don't think this is correct to place a DISubroutine after
+		// a "call" instruction (for its !dbg metadata)...
+		// For inline-able calls: Are we meant to place a DILocation containing info of
+		// called from or calling proc?
 		ir_print_debug_location(f, m, value, instr->block->proc);
 
 		break;
@@ -1543,7 +1589,6 @@ void ir_print_instr(irFileBuffer *f, irModule *m, irValue *value) {
 
 		irInstrDebugDeclare *dd = &instr->DebugDeclare;
 		Type *vt = ir_type(dd->value);
-		irDebugInfo *di = dd->scope;
 		Entity *e = dd->entity;
 		String name = e->token.string;
 		TokenPos pos = e->token.pos;
@@ -1558,8 +1603,9 @@ void ir_print_instr(irFileBuffer *f, irModule *m, irValue *value) {
 		ir_write_byte(f, ' ');
 		ir_print_value(f, m, dd->value, vt);
 		ir_fprintf(f, ", metadata !%d", local_var_di->id);
-		ir_write_str_lit(f, ", metadata !DIExpression())"); 
-		ir_fprintf(f, ", !dbg !DILocation(line: %td, column: %td, scope: !%d)", pos.line, pos.column, di->id);
+		ir_write_str_lit(f, ", metadata !DIExpression())");
+		GB_ASSERT(dd->loc == dd->value->loc);
+		ir_print_debug_location(f, m, dd->value);
 		break;
 	}
 	}
@@ -1687,6 +1733,8 @@ void ir_print_proc(irFileBuffer *f, irModule *m, irProcedure *proc) {
 		ir_write_str_lit(f, "{\n");
 		for_array(i, proc->blocks) {
 			irBlock *block = proc->blocks[i];
+
+			m->curr_debug_loc = nullptr; // Reset debug location TODO(lachsinc): Reset at block or proc start?
 
 			if (i > 0) ir_write_byte(f, '\n');
 			ir_print_block_name(f, block);
@@ -1903,6 +1951,7 @@ void print_llvm_ir(irGen *ir) {
 				ir_write_string(f, str_lit("zeroinitializer"));
 			}
 			if (m->generate_debug_info) {
+				// TODO(lachsinc): Store this inside g->value->loc ???
 				irDebugInfo **di_lookup = map_get(&m->debug_info, hash_entity(g->entity));
 				if (di_lookup != nullptr) {
 					irDebugInfo *di = *di_lookup;
@@ -1993,9 +2042,23 @@ void print_llvm_ir(irGen *ir) {
 				            di->Proc.pos.line,
 				            di->Proc.pos.line, // NOTE(lachsinc): Assume scopeLine always same as line.
 				            m->debug_compile_unit->id,
-							di->Proc.types->id);
+				            di->Proc.types->id);
 				ir_write_byte(f, ')'); // !DISubprogram(
 				break;
+			case irDebugInfo_Location: {
+				GB_ASSERT_NOT_NULL(di->Location.scope);
+				// TODO(lachsinc): Temporary.
+				GB_ASSERT(di->Location.pos.line > 0 && di->Location.pos.line < 65536);
+				GB_ASSERT(di->Location.pos.column > 0 && di->Location.pos.column < 65536);
+				ir_fprintf(f, "!DILocation("
+				              "line: %td"
+				            ", column: %td"
+				            ", scope: !%d)",
+				            di->Location.pos.line,
+				            di->Location.pos.column,
+				            di->Location.scope->id);
+				break;
+			}
 			case irDebugInfo_GlobalVariableExpression: {
 				ir_fprintf(f, "!DIGlobalVariableExpression("
 				              "var: !%d"

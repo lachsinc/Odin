@@ -28,8 +28,10 @@ struct irModule {
 	irDebugInfo *         debug_compile_unit;
 	irDebugInfo *         debug_all_enums;   // irDebugInfoArray
 	irDebugInfo *         debug_all_globals; // irDebugInfoArray
-
-
+	// NOTE(lachsinc): This is maybe dumb, but it lets us expose debug locations for
+	// instructions that need debug location but don't have one set (esp. generated instructions).
+	// Reset every time we enter a new block. TODO(lachsinc): reset at proc or block??
+	irDebugInfo *         curr_debug_loc;
 
 	i32                   global_string_index;
 	i32                   global_array_index; // For ConstantSlice
@@ -257,7 +259,7 @@ gbAllocator ir_allocator(void) {
 	})                                                                \
 	IR_INSTR_KIND(StartupRuntime, i32)                                \
 	IR_INSTR_KIND(DebugDeclare, struct {                              \
-		irDebugInfo *scope;                                           \
+		irDebugInfo *loc;                                             \
 		Ast *        expr;                                            \
 		Entity *     entity;                                          \
 		bool         is_addr;                                         \
@@ -424,7 +426,7 @@ struct irValue {
 	irValueKind     kind;
 	i32             index;
 	bool            index_set;
-	irDebugLocation loc;
+	irDebugInfo *   loc; // irDebugLocation loc;
 	union {
 		irValueConstant      Constant;
 		irValueConstantSlice ConstantSlice;
@@ -528,7 +530,8 @@ enum irDebugInfoKind {
 	irDebugInfo_File,
 	irDebugInfo_Scope,
 	irDebugInfo_Proc,
-	irDebugInfo_AllProcs,
+	irDebugInfo_Location,
+	irDebugInfo_AllProcs, // TODO(lachsinc): Merge w/ DebugInfoArray
 
 	irDebugInfo_BasicType,      // basic types
 	irDebugInfo_ProcType,
@@ -575,6 +578,10 @@ struct irDebugInfo {
 			irDebugInfo * types; // !{return, return, param, param, param.. etc.}
 			// TODO(lachsinc): variables / retainedNodes ?
 		} Proc;
+		struct {
+			TokenPos pos;
+			irDebugInfo *scope;
+		} Location;
 		struct {
 			Array<irDebugInfo *> procs;
 		} AllProcs; // TODO(lachsinc): Redundant w/ DebugInfoArray. Merge.
@@ -1132,9 +1139,9 @@ irValue *ir_instr_comment(irProcedure *p, String text) {
 	return v;
 }
 
-irValue *ir_instr_debug_declare(irProcedure *p, irDebugInfo *scope, Ast *expr, Entity *entity, bool is_addr, irValue *value) {
+irValue *ir_instr_debug_declare(irProcedure *p, irDebugInfo *loc, Ast *expr, Entity *entity, bool is_addr, irValue *value) {
 	irValue *v = ir_alloc_instr(p, irInstr_DebugDeclare);
-	v->Instr.DebugDeclare.scope      = scope;
+	v->Instr.DebugDeclare.loc        = loc; // TODO(lachsinc): Take from value->loc if correct, or use v->loc, remove altogether ???
 	v->Instr.DebugDeclare.expr       = expr;
 	v->Instr.DebugDeclare.entity     = entity;
 	v->Instr.DebugDeclare.is_addr    = is_addr;
@@ -1412,6 +1419,7 @@ void ir_push_context_onto_stack(irProcedure *proc, irValue *ctx) {
 }
 
 irDebugInfo *ir_add_debug_info_local(irModule *module, Entity *e, i32 arg_id, irDebugInfo *scope, irDebugInfo *file);
+void ir_add_debug_location_to_value(irProcedure *proc, irValue *v, Ast *expr);
 
 irValue *ir_add_local(irProcedure *proc, Entity *e, Ast *expr, bool zero_initialized) {
 	irBlock *b = proc->decl_block; // all variables must be in the first block
@@ -1426,14 +1434,17 @@ irValue *ir_add_local(irProcedure *proc, Entity *e, Ast *expr, bool zero_initial
 	}
 
 	if (expr != nullptr && proc->entity != nullptr) {
+		// TODO(lachsinc): Correct place to do this ??
+		ir_add_debug_location_to_value(proc, instr, expr);
 		irDebugInfo *di = *map_get(&proc->module->debug_info, hash_entity(proc->entity));
-		ir_emit(proc, ir_instr_debug_declare(proc, di, expr, e, true, instr));
+
+		ir_emit(proc, ir_instr_debug_declare(proc, instr->loc, expr, e, true, instr));
 
 		// TODO(lachsinc): "Arg" is not used yet but should be eventually, if applicable, set to param index
 		// NOTE(lachsinc): The following call recurses through a type creating or finding the necessary debug info.
 		// This approach may be quite detrimental to perf?
 		// This may not be the most appropriate place to place this? (for proc non-value params etc.)
-		ir_add_debug_info_local(proc->module, e, 0, di, di->Proc.file);
+		ir_add_debug_info_local(proc->module, e, 0, instr->loc->Location.scope, di->Proc.file);
 	}
 
 	return instr;
@@ -1560,24 +1571,26 @@ irDebugInfo *ir_add_debug_info_file(irModule *module, AstFile *file) {
 		return *existing;
 	}
 
-	GB_ASSERT(file != nullptr);
+	GB_ASSERT_NOT_NULL(file);
+
 	irDebugInfo *di = ir_alloc_debug_info(irDebugInfo_File);
 	di->File.file = file;
 
-	String filename = file->tokenizer.fullpath;
+	// TODO(lachsinc): HACK..
+	String filename = make_string(nullptr, 0);
+	filename = file->tokenizer.fullpath;
 	String directory = filename;
 	isize slash_index = 0;
-	for (isize i = filename.len-1; i >= 0; i--) {
+	for (isize i = filename.len - 1; i >= 0; i--) {
 		if (filename[i] == '\\' ||
-		    filename[i] == '/') {
+			filename[i] == '/') {
 			break;
 		}
 		slash_index = i;
 	}
-	directory.len = slash_index-1;
+	directory.len = slash_index - 1;
 	filename.text = filename.text + slash_index;
 	filename.len -= slash_index;
-
 
 	di->File.filename = filename;
 	di->File.directory = directory;
@@ -2195,8 +2208,6 @@ irDebugInfo *ir_add_debug_info_proc(irProcedure *proc, Entity *entity, String na
 			if (e->kind != Entity_Variable) {
 				continue; // TODO(lachsinc): Confirm correct?
 			}
-
-			// irDebugInfo *type_di = ir_add_debug_info_type(proc->module, di, e, e->type, file);
 			irDebugInfo *type_di = ir_add_debug_info_type(proc->module, e->type, nullptr, nullptr, nullptr);
 			GB_ASSERT_NOT_NULL(type_di);
 			array_add(&di->Proc.types->DebugInfoArray.elements, type_di);
@@ -2215,8 +2226,6 @@ irDebugInfo *ir_add_debug_info_proc(irProcedure *proc, Entity *entity, String na
 			if (e->kind != Entity_Variable) {
 				continue; // TODO(lachsinc): Confirm correct?
 			}
-			// TODO(lachsinc): Could technically be a local?
-			// irDebugInfo *type_di = ir_add_debug_info_type(proc->module, di, e, e->type, file);
 			irDebugInfo *type_di = ir_add_debug_info_type(proc->module, e->type, nullptr, nullptr, nullptr);
 			GB_ASSERT_NOT_NULL(type_di);
 			array_add(&di->Proc.types->DebugInfoArray.elements, type_di);
@@ -2229,6 +2238,21 @@ irDebugInfo *ir_add_debug_info_proc(irProcedure *proc, Entity *entity, String na
 	return di;
 }
 
+irDebugInfo *ir_add_debug_info_loc(irModule *m, Ast *expr, irDebugInfo *scope) {
+	GB_ASSERT_NOT_NULL(expr);
+	// NOTE(lachsinc): I'm not sure of the performance implications of this.. how many
+	// values are associated with valid unique expr's etc?
+	// Are Ast* all unique? Safe to hash??
+	irDebugInfo **existing = map_get(&m->debug_info, hash_pointer(expr));
+	if (existing != nullptr) {
+		return *existing;
+	}
+	irDebugInfo *di = ir_alloc_debug_info(irDebugInfo_Location);
+	di->Location.pos = ast_token(expr).pos;
+	di->Location.scope = scope;
+	map_set(&m->debug_info, hash_node(expr), di);
+	return di;
+}
 
 ////////////////////////////////////////////////////////////////
 //
@@ -2266,10 +2290,24 @@ irValue *ir_emit_select(irProcedure *p, irValue *cond, irValue *t, irValue *f) {
 	return ir_emit(p, ir_instr_select(p, cond, t, f));
 }
 
-void ir_add_debug_location_to_value(irProcedure *proc, irValue *v, Ast *e) {
-	if (v != nullptr && e != nullptr) {
-		v->loc.debug_scope = proc->debug_scope;
-		v->loc.pos = ast_token(e).pos;
+void ir_add_debug_location_to_value(irProcedure *proc, irValue *v, Ast *expr) {
+	GB_ASSERT_NOT_NULL(proc);
+	GB_ASSERT_NOT_NULL(v);
+	// GB_ASSERT_NOT_NULL(expr);
+	if (v->loc != nullptr) {
+		return; // Already set
+	}
+
+	if (expr != nullptr) {
+		// TODO(lachsinc): HACK, this doesn't belong here. Proc's debug info should be created prior
+		// to adding proc-values. May be better to handle arbitrary files/proc/scope irDebugInfo
+		// so this will work on globals etc.
+		if (proc->debug_scope == nullptr) {
+			irDebugInfo *di_file = ir_add_debug_info_file(proc->module, expr->file);
+			ir_add_debug_info_proc(proc, proc->entity, proc->name, di_file, di_file);
+		}
+		GB_ASSERT_NOT_NULL(proc->debug_scope);
+		v->loc = ir_add_debug_info_loc(proc->module, expr, proc->debug_scope);
 	}
 }
 
@@ -8276,13 +8314,15 @@ void ir_module_add_value(irModule *m, Entity *e, irValue *v) {
 	// TODO(lachsinc): This may not be the most sensible place to do this!
 	// it may be more sensible to look for more specific locations that call ir_value_global and assign it a value? maybe?
 	// ir_value_global itself doesn't have access to module and I'm trying to minimise changes to non-debug ir stuff.
-	if (v->kind == irValue_Global && v->Global.value != nullptr && e->state == EntityState_Resolved) {
-		CheckerInfo *info = m->info;
-		String filename = e->token.pos.file;
-		AstFile *f = ast_file_of_filename(info, filename);
-		GB_ASSERT(f);
-		irDebugInfo *di_file = ir_add_debug_info_file(m, f);
-		ir_add_debug_info_global(m, v, di_file);
+	if (m->generate_debug_info) {
+		if (v->kind == irValue_Global && v->Global.value != nullptr && e->state == EntityState_Resolved) {
+			CheckerInfo *info = m->info;
+			String filename = e->token.pos.file;
+			AstFile *f = ast_file_of_filename(info, filename);
+			GB_ASSERT(f);
+			irDebugInfo *di_file = ir_add_debug_info_file(m, f);
+			ir_add_debug_info_global(m, v, di_file);
+		}
 	}
 }
 
