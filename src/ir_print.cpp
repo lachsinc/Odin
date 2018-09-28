@@ -2048,8 +2048,8 @@ void print_llvm_ir(irGen *ir) {
 			case irDebugInfo_Location: {
 				GB_ASSERT_NOT_NULL(di->Location.scope);
 				// TODO(lachsinc): Temporary.
-				GB_ASSERT(di->Location.pos.line > 0 && di->Location.pos.line < 65536);
-				GB_ASSERT(di->Location.pos.column > 0 && di->Location.pos.column < 65536);
+				GB_ASSERT(di->Location.pos.line >= 0 && di->Location.pos.line < 65536);
+				GB_ASSERT(di->Location.pos.column >= 0 && di->Location.pos.column < 65536);
 				ir_fprintf(f, "!DILocation("
 				              "line: %td"
 				            ", column: %td"
