@@ -338,7 +338,7 @@ gb_global Scope *     builtin_scope = nullptr;
 
 
 
-HashKey hash_node     (Ast *node)  { return hash_pointer(node); }
+HashKey hash_node     (Ast *node)      { return hash_pointer(node); }
 HashKey hash_ast_file (AstFile *file)  { return hash_pointer(file); }
 HashKey hash_entity   (Entity *e)      { return hash_pointer(e); }
 HashKey hash_type     (Type *t)        { return hash_pointer(t); }

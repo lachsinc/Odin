@@ -26,11 +26,10 @@ struct irModule {
 	Map<irValue *>        anonymous_proc_lits; // Key: Ast *
 
 	irDebugInfo *         debug_compile_unit;
-	irDebugInfo *         debug_all_enums;   // irDebugInfoArray
-	irDebugInfo *         debug_all_globals; // irDebugInfoArray
-	// NOTE(lachsinc): This is maybe dumb, but it lets us expose debug locations for
-	// instructions that need debug location but don't have one set (esp. generated instructions).
-	// Reset every time we enter a new block. TODO(lachsinc): reset at proc or block??
+	irDebugInfo *         debug_all_enums;   // TODO(lachsinc): Move into irDebugInfo_CompileUnit ?
+	irDebugInfo *         debug_all_globals; // TODO(lachsinc): Move into irDebugInfo_CompileUnit ?
+	// NOTE(lachsinc): Temporary; used as a fallback when printing instructions that uses a 
+	// the last set debug info/expr location when we need one, but one is not available. Reset on entry of every proc.
 	irDebugInfo *         curr_debug_loc;
 
 	i32                   global_string_index;
@@ -637,7 +636,6 @@ struct irDebugInfo {
 			TokenPos     pos;
 			irDebugInfo *type;
 			irValue     *variable;
-			// irDebugInfo *declaration;
 		} GlobalVariable;
 		struct {
 			String       name;
@@ -826,13 +824,13 @@ irValue *ir_typeid              (irModule *m, Type *type);
 irValue *ir_build_expr          (irProcedure *proc, Ast *_zxcv, Ast *expr);
 void     ir_build_stmt          (irProcedure *proc, Ast *node);
 irValue *ir_build_cond          (irProcedure *proc, Ast *_zxcv, Ast *cond, irBlock *true_block, irBlock *false_block);
-void     ir_build_defer_stmt    (irProcedure *proc, Ast *_zxcv, irDefer d);
+void     ir_build_defer_stmt    (irProcedure *proc, irDefer d);
 irAddr   ir_build_addr          (irProcedure *proc, Ast *_zxcv, Ast *expr);
 void     ir_build_proc          (irValue *value, irProcedure *parent);
 void     ir_gen_global_type_name(irModule *m, Entity *e, String name);
 irValue *ir_get_type_info_ptr   (irProcedure *proc, Type *type);
+void     ir_value_set_debug_location(irProcedure *proc, Ast *_zxcv, irValue *v);
 irDebugInfo *ir_add_debug_info_local(irModule *module, Entity *e, i32 arg_id, irDebugInfo *scope, irDebugInfo *file);
-void ir_add_debug_location_to_value(irProcedure *proc, Ast *_zxcv, irValue *v);
 
 
 
@@ -1182,7 +1180,11 @@ irValue *ir_emit(irProcedure *proc, Ast *_zxcv, irValue *instr) {
 		GB_PANIC("ir_emit: Instruction missing parent block");
 	}
 	if (proc->module->generate_debug_info && _zxcv != nullptr) {
-		ir_add_debug_location_to_value(proc, _zxcv, instr); // TODO(lachsinc): Still do even if ir_is_instr_terminating() ??
+		// NOTE(lachsinc): SPEED This performs a hash-table lookup (for a irDebugInfo_Location associated with the ast node)
+		// for _every single_ ir_emit()!! If this has a noticable impact on debug-enabled build times we can call this at the top of 
+		// the ir_emit herarchy, as soon as we have the suitable ast node, and pass its returned result down the stack. (or push()/pop()
+		// onto a stack inside irModule).
+		ir_value_set_debug_location(proc, _zxcv, instr); 
 	}
 	return instr;
 }
@@ -1422,7 +1424,7 @@ void ir_push_context_onto_stack(irProcedure *proc, irValue *ctx) {
 	array_add(&proc->context_stack, cd);
 }
 
-irValue *ir_add_local(irProcedure *proc, Entity *e, Ast *expr, bool zero_initialized) {
+irValue *ir_add_local(irProcedure *proc, Ast *_zxcv, Entity *e, Ast *expr, bool zero_initialized) {
 	irBlock *b = proc->decl_block; // all variables must be in the first block
 	irValue *instr = ir_instr_local(proc, e, true);
 	instr->Instr.block = b;
@@ -1431,14 +1433,14 @@ irValue *ir_add_local(irProcedure *proc, Entity *e, Ast *expr, bool zero_initial
 	proc->local_count++;
 
 	if (zero_initialized) {
-		ir_emit_zero_init(proc, expr, instr);
+		ir_emit_zero_init(proc, _zxcv, instr);
 	}
 
 	if (expr != nullptr && proc->entity != nullptr) {
-		ir_add_debug_location_to_value(proc, expr, instr);		// TODO(lachsinc): Remove ???
+		ir_value_set_debug_location(proc, _zxcv, instr); // TODO(lachsinc): Remove ???
 		irDebugInfo *di = *map_get(&proc->module->debug_info, hash_entity(proc->entity));
 
-		ir_emit(proc, expr, ir_instr_debug_declare(proc, instr->loc, expr, e, true, instr));
+		ir_emit(proc, _zxcv, ir_instr_debug_declare(proc, instr->loc, expr, e, true, instr));
 
 		// TODO(lachsinc): "Arg" is not used yet but should be eventually, if applicable, set to param index
 		// NOTE(lachsinc): The following call recurses through a type creating or finding the necessary debug info.
@@ -1450,7 +1452,7 @@ irValue *ir_add_local(irProcedure *proc, Entity *e, Ast *expr, bool zero_initial
 	return instr;
 }
 
-irValue *ir_add_local_for_identifier(irProcedure *proc, Ast *ident, bool zero_initialized) {
+irValue *ir_add_local_for_identifier(irProcedure *proc, Ast *_zxcv, Ast *ident, bool zero_initialized) {
 	Entity *e = entity_of_ident(ident);
 	if (e != nullptr) {
 		String name = e->token.string;
@@ -1472,12 +1474,12 @@ irValue *ir_add_local_for_identifier(irProcedure *proc, Ast *ident, bool zero_in
 				return *prev_value;
 			}
 		}
-		return ir_add_local(proc, e, ident, zero_initialized);
+		return ir_add_local(proc, _zxcv, e, ident, zero_initialized);
 	}
 	return nullptr;
 }
 
-irValue *ir_add_local_generated(irProcedure *proc, Type *type, bool zero_initialized = true) {
+irValue *ir_add_local_generated(irProcedure *proc, Ast *_zxcv, Type *type, bool zero_initialized = true) {
 	GB_ASSERT(type != nullptr);
 	type = default_type(type);
 
@@ -1486,7 +1488,7 @@ irValue *ir_add_local_generated(irProcedure *proc, Type *type, bool zero_initial
 		scope = proc->curr_block->scope;
 	}
 	Entity *e = alloc_entity_variable(scope, empty_token, type, false);
-	return ir_add_local(proc, e, nullptr, zero_initialized);
+	return ir_add_local(proc, _zxcv, e, nullptr, zero_initialized);
 }
 
 
@@ -1513,30 +1515,32 @@ irValue *ir_add_param(irProcedure *proc, Entity *e, Ast *expr, Type *abi_type) {
 	irValue *v = ir_value_param(proc, e, abi_type);
 	irValueParam *p = &v->Param;
 
+	Ast *_zxcv = expr; // TOOD(lachsinc): Cleanup, confirm correct.
+
 	switch (p->kind) {
 	case irParamPass_Value: {
-		irValue *l = ir_add_local(proc, e, expr, false);
+		irValue *l = ir_add_local(proc, _zxcv, e, expr, false);
 		irValue *x = v;
 		if (abi_type == t_llvm_bool) {
 			x = ir_emit_conv(proc, expr, x, t_bool);
 		}
-		ir_emit_store(proc, expr, l, x);
+		ir_emit_store(proc, _zxcv, l, x);
 		return x;
 	}
 	case irParamPass_Pointer:
 		ir_module_add_value(proc->module, e, v);
-		return ir_emit_load(proc, expr, v);
+		return ir_emit_load(proc, _zxcv, v);
 
 	case irParamPass_Integer: {
-		irValue *l = ir_add_local(proc, e, expr, false);
-		irValue *iptr = ir_emit_conv(proc, expr, l, alloc_type_pointer(p->type));
-		ir_emit_store(proc, expr, iptr, v);
-		return ir_emit_load(proc, expr, l);
+		irValue *l = ir_add_local(proc, _zxcv, e, expr, false);
+		irValue *iptr = ir_emit_conv(proc, _zxcv, l, alloc_type_pointer(p->type));
+		ir_emit_store(proc, _zxcv, iptr, v);
+		return ir_emit_load(proc, _zxcv, l);
 	}
 
 	case irParamPass_ConstRef:
 		ir_module_add_value(proc->module, e, v);
-		return ir_emit_load(proc, expr, v);
+		return ir_emit_load(proc, _zxcv, v);
 	}
 
 	GB_PANIC("Unreachable");
@@ -2238,17 +2242,16 @@ irDebugInfo *ir_add_debug_info_proc(irProcedure *proc, Entity *entity, String na
 	return di;
 }
 
-irDebugInfo *ir_add_debug_info_loc(irModule *m, Ast *_zxcv, irDebugInfo *scope) {
+irDebugInfo *ir_add_debug_info_location(irModule *m, Ast *_zxcv, irDebugInfo *scope) {
 	GB_ASSERT_NOT_NULL(_zxcv);
-	// NOTE(lachsinc): I'm not sure of the performance implications of this.. how many
-	// values are associated with valid unique expr's etc?
-	// Are Ast* all unique? Safe to hash??
-	irDebugInfo **existing = map_get(&m->debug_info, hash_pointer(_zxcv));
+	// TODO(lachsinc): Should we traverse the node/children until we find one with
+	// valid token/pos and use that instead??
+	irDebugInfo **existing = map_get(&m->debug_info, hash_node(_zxcv));
 	if (existing != nullptr) {
 		return *existing;
 	}
 	irDebugInfo *di = ir_alloc_debug_info(irDebugInfo_Location);
-	di->Location.pos = ast_token(_zxcv).pos;
+	di->Location.pos = ast_token(_zxcv).pos; 
 	di->Location.scope = scope;
 	map_set(&m->debug_info, hash_node(_zxcv), di);
 	return di;
@@ -2290,33 +2293,32 @@ irValue *ir_emit_select(irProcedure *p, Ast *_zxcv, irValue *cond, irValue *t, i
 	return ir_emit(p, _zxcv, ir_instr_select(p, cond, t, f));
 }
 
-void ir_add_debug_location_to_value(irProcedure *proc, Ast *_zxcv, irValue *v) {
+void ir_value_set_debug_location(irProcedure *proc, Ast *_zxcv, irValue *v) {
 	GB_ASSERT_NOT_NULL(proc);
 	GB_ASSERT_NOT_NULL(v);
-	// GB_ASSERT_NOT_NULL(_zxcv);
+	GB_ASSERT_NOT_NULL(_zxcv);
+
 	if (v->loc != nullptr) {
 		return; // Already set
 	}
 
 	if (_zxcv != nullptr) {
-		// TODO(lachsinc): HACK, this doesn't belong here. Proc's debug info should be created prior
-		// to adding proc-values. May be better to handle arbitrary files/proc/scope irDebugInfo
-		// so this will work on globals etc.
+		// TODO(lachsinc): HACK; This shouldn't be done here. Proc's debug info should be created prior
+		// to adding proc-values. 
+		// TODO(lachsinc): Handle arbitrary files/proc/scope irDebugInfo's so this function works on globals etc. ?
 		if (proc->debug_scope == nullptr) {
 			irDebugInfo *di_file = ir_add_debug_info_file(proc->module, _zxcv->file);
 			ir_add_debug_info_proc(proc, proc->entity, proc->name, di_file, di_file);
 		}
 		GB_ASSERT_NOT_NULL(proc->debug_scope);
-		v->loc = ir_add_debug_info_loc(proc->module, _zxcv, proc->debug_scope);
-		if (v->loc != nullptr) {
-			return;
-		}
+		v->loc = ir_add_debug_info_location(proc->module, _zxcv, proc->debug_scope);
+		GB_ASSERT_MSG(v->loc != nullptr, "Unable to set debug location for irValue.");
 	}
-
-	GB_PANIC("BeepBoop");
 }
 
 void ir_emit_zero_init(irProcedure *p, Ast *_zxcv, irValue *address) {
+	GB_ASSERT_NOT_NULL(_zxcv); // TODO(lachsinc): Temp RemoveMe
+
 	gbAllocator a = ir_allocator();
 	Type *t = type_deref(ir_type(address));
 	auto args = array_make<irValue *>(a, 2);
@@ -2351,7 +2353,7 @@ irValue *ir_copy_value_to_ptr(irProcedure *proc, Ast *_zxcv, irValue *val, Type 
 	if (alignment < type_alignment) {
 		alignment = type_alignment;
 	}
-	irValue *ptr = ir_add_local_generated(proc, new_type);
+	irValue *ptr = ir_add_local_generated(proc, _zxcv, new_type);
 	ptr->Instr.Local.alignment = alignment;
 	ir_emit_store(proc, _zxcv, ptr, val);
 	return ptr;
@@ -2384,7 +2386,7 @@ irValue *ir_find_or_generate_context_ptr(irProcedure *proc, Ast *_zxcv) {
 
 	defer (proc->curr_block = tmp_block);
 
-	irValue *c = ir_add_local_generated(proc, t_context);
+	irValue *c = ir_add_local_generated(proc, _zxcv, t_context);
 	ir_push_context_onto_stack(proc, c);
 	ir_emit_store(proc, _zxcv, c, ir_emit_load(proc, _zxcv, proc->module->global_default_context));
 
@@ -2455,7 +2457,7 @@ irValue *ir_emit_call(irProcedure *p, Ast *_zxcv, irValue *value, Array<irValue 
 	Type *abi_rt = pt->Proc.abi_compat_result_type;
 	Type *rt = reduce_tuple_to_single_type(results);
 	if (pt->Proc.return_by_pointer) {
-		irValue *return_ptr = ir_add_local_generated(p, rt);
+		irValue *return_ptr = ir_add_local_generated(p, _zxcv, rt);
 		GB_ASSERT(is_type_pointer(ir_type(return_ptr)));
 		ir_emit(p, _zxcv, ir_instr_call(p, value, return_ptr, args, nullptr, context_ptr, inlining));
 		return ir_emit_load(p, _zxcv, return_ptr);
@@ -2495,8 +2497,6 @@ irValue *ir_emit_package_call(irProcedure *proc, Ast *_zxcv, char const *package
 
 
 void ir_emit_defer_stmts(irProcedure *proc, irDeferExitKind kind, irBlock *block) {
-	Ast *_zxcv = nullptr; // TODO(lachsinc): Find location for defer statement???
-
 	isize count = proc->defer_stmts.count;
 	isize i = count;
 	while (i --> 0) {
@@ -2508,19 +2508,19 @@ void ir_emit_defer_stmts(irProcedure *proc, irDeferExitKind kind, irBlock *block
 		if (kind == irDeferExit_Default) {
 			if (proc->scope_index == d.scope_index &&
 			    d.scope_index > 0) { // TODO(bill): Which is correct: > 0 or > 1?
-				ir_build_defer_stmt(proc, _zxcv, d);
+				ir_build_defer_stmt(proc, d);
 				array_pop(&proc->defer_stmts);
 				continue;
 			} else {
 				break;
 			}
 		} else if (kind == irDeferExit_Return) {
-			ir_build_defer_stmt(proc, _zxcv, d);
+			ir_build_defer_stmt(proc, d);
 		} else if (kind == irDeferExit_Branch) {
 			GB_ASSERT(block != nullptr);
 			isize lower_limit = block->scope_index+1;
 			if (lower_limit < d.scope_index) {
-				ir_build_defer_stmt(proc, _zxcv, d);
+				ir_build_defer_stmt(proc, d);
 			}
 		}
 	}
@@ -2603,7 +2603,7 @@ irValue *ir_emit_comp(irProcedure *proc, Ast *_zxcv, TokenKind op_kind, irValue 
 irValue *ir_gen_map_header(irProcedure *proc, Ast *_zxcv, irValue *map_val_ptr, Type *map_type) {
 	GB_ASSERT_MSG(is_type_pointer(ir_type(map_val_ptr)), "%s", type_to_string(ir_type(map_val_ptr)));
 	gbAllocator a = ir_allocator();
-	irValue *h = ir_add_local_generated(proc, t_map_header);
+	irValue *h = ir_add_local_generated(proc, _zxcv, t_map_header);
 	map_type = base_type(map_type);
 
 	Type *key_type = map_type->Map.key;
@@ -2634,7 +2634,7 @@ irValue *ir_gen_map_header(irProcedure *proc, Ast *_zxcv, irValue *map_val_ptr, 
 
 irValue *ir_gen_map_key(irProcedure *proc, Ast *_zxcv, irValue *key, Type *key_type) {
 	Type *hash_type = t_u64;
-	irValue *v = ir_add_local_generated(proc, t_map_key);
+	irValue *v = ir_add_local_generated(proc, _zxcv, t_map_key);
 	Type *t = base_type(ir_type(key));
 	key = ir_emit_conv(proc, _zxcv, key, key_type);
 	if (is_type_integer(t)) {
@@ -2683,7 +2683,7 @@ irValue *ir_address_from_load_or_generate_local(irProcedure *proc, Ast *_zxcv, i
 		}
 	}
 	Type *type = ir_type(val);
-	irValue *local = ir_add_local_generated(proc, type);
+	irValue *local = ir_add_local_generated(proc, _zxcv, type);
 	ir_emit_store(proc, _zxcv, local, val);
 	return local;
 }
@@ -2719,7 +2719,7 @@ irValue *ir_insert_dynamic_map_key_and_value(irProcedure *proc, Ast *_zxcv, irVa
 	irValue *key = ir_gen_map_key(proc, _zxcv, map_key, map_type->Map.key);
 	irValue *v = ir_emit_conv(proc, _zxcv, map_value, map_type->Map.value);
 
-	irValue *ptr = ir_add_local_generated(proc, ir_type(v));
+	irValue *ptr = ir_add_local_generated(proc, _zxcv, ir_type(v));
 	ir_emit_store(proc, _zxcv, ptr, v);
 
 	auto args = array_make<irValue *>(ir_allocator(), 4);
@@ -2810,7 +2810,7 @@ void ir_addr_store(irProcedure *proc, Ast *_zxcv, irAddr const &addr, irValue *v
 	} else if (addr.kind == irAddr_Context) {
 		irValue *new_context = ir_emit_conv(proc, _zxcv, value, ir_addr_type(addr));
 
-		irValue *next = ir_add_local_generated(proc, t_context);
+		irValue *next = ir_add_local_generated(proc, _zxcv, t_context);
 		ir_emit_store(proc, _zxcv, next, new_context);
 
 		ir_push_context_onto_stack(proc, next);
@@ -2831,7 +2831,7 @@ irValue *ir_addr_load(irProcedure *proc, Ast *_zxcv, irAddr const &addr) {
 	if (addr.kind == irAddr_Map) {
 		// TODO(bill): map lookup
 		Type *map_type = base_type(addr.map_type);
-		irValue *v = ir_add_local_generated(proc, map_type->Map.lookup_result_type);
+		irValue *v = ir_add_local_generated(proc, _zxcv, map_type->Map.lookup_result_type);
 		irValue *h = ir_gen_map_header(proc, _zxcv, addr.addr, map_type);
 		irValue *key = ir_gen_map_key(proc, _zxcv, addr.map_key, map_type->Map.key);
 
@@ -3011,7 +3011,7 @@ irLoopData ir_loop_start(irProcedure *proc, Ast *_zxcv, isize count) {
 
 	irValue *max = ir_const_int(count);
 
-	data.idx_addr = ir_add_local_generated(proc, t_int);
+	data.idx_addr = ir_add_local_generated(proc, _zxcv, t_int);
 
 	data.body = ir_new_block(proc, nullptr, "loop.body");
 	data.done = ir_new_block(proc, nullptr, "loop.done");
@@ -3066,7 +3066,7 @@ irValue *ir_emit_unary_arith(irProcedure *proc, Ast *_zxcv, TokenKind op, irValu
 		GB_ASSERT(is_type_array(type));
 		Type *elem_type = base_array_type(type);
 
-		irValue *res = ir_add_local_generated(proc, type);
+		irValue *res = ir_add_local_generated(proc, _zxcv, type);
 
 		bool inline_array_arith = type_size_of(type) <= build_context.max_align;
 
@@ -3117,7 +3117,7 @@ irValue *ir_emit_arith(irProcedure *proc, Ast *_zxcv, TokenKind op, irValue *lef
 		GB_ASSERT(is_type_array(type));
 		Type *elem_type = base_array_type(type);
 
-		irValue *res = ir_add_local_generated(proc, type);
+		irValue *res = ir_add_local_generated(proc, _zxcv, type);
 		i64 count = base_type(type)->Array.count;
 
 		bool inline_array_arith = type_size_of(type) <= build_context.max_align;
@@ -3162,7 +3162,7 @@ irValue *ir_emit_arith(irProcedure *proc, Ast *_zxcv, TokenKind op, irValue *lef
 			}
 		}
 
-		irValue *res = ir_add_local_generated(proc, type);
+		irValue *res = ir_add_local_generated(proc, _zxcv, type);
 		irValue *a = ir_emit_struct_ev(proc, _zxcv, left,  0);
 		irValue *b = ir_emit_struct_ev(proc, _zxcv, left,  1);
 		irValue *c = ir_emit_struct_ev(proc, _zxcv, right, 0);
@@ -3804,7 +3804,7 @@ void ir_fill_string(irProcedure *proc, Ast *_zxcv, irValue *string_ptr, irValue 
 }
 
 irValue *ir_emit_string(irProcedure *proc, Ast *_zxcv, irValue *elem, irValue *len) {
-	irValue *str = ir_add_local_generated(proc, t_string);
+	irValue *str = ir_add_local_generated(proc, _zxcv, t_string);
 	ir_fill_string(proc, _zxcv, str, elem, len);
 	return ir_emit_load(proc, _zxcv, str);
 }
@@ -3838,7 +3838,7 @@ irValue *ir_add_local_slice(irProcedure *proc, Ast *_zxcv, Type *slice_type, irV
 
 	elem = ir_emit_ptr_offset(proc, _zxcv, elem, low);
 
-	irValue *slice = ir_add_local_generated(proc, slice_type);
+	irValue *slice = ir_add_local_generated(proc, _zxcv, slice_type);
 	ir_fill_slice(proc, _zxcv, slice, elem, len);
 	return slice;
 }
@@ -3945,7 +3945,7 @@ irValue *ir_emit_conv(irProcedure *proc, Ast *_zxcv, irValue *value, Type *t) {
 
 	if (value->kind == irValue_Constant) {
 		if (is_type_any(dst)) {
-			irValue *default_value = ir_add_local_generated(proc, default_type(src_type));
+			irValue *default_value = ir_add_local_generated(proc, _zxcv, default_type(src_type));
 			ir_emit_store(proc, _zxcv, default_value, value);
 			return ir_emit_conv(proc, _zxcv, ir_emit_load(proc, _zxcv, default_value), t_any);
 		} else if (dst->kind == Type_Basic) {
@@ -4084,7 +4084,7 @@ irValue *ir_emit_conv(irProcedure *proc, Ast *_zxcv, irValue *value, Type *t) {
 
 	if (is_type_complex(src) && is_type_complex(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		irValue *gen = ir_add_local_generated(proc, dst);
+		irValue *gen = ir_add_local_generated(proc, _zxcv, dst);
 		irValue *real = ir_emit_conv(proc, _zxcv, ir_emit_struct_ev(proc, _zxcv, value, 0), ft);
 		irValue *imag = ir_emit_conv(proc, _zxcv, ir_emit_struct_ev(proc, _zxcv, value, 1), ft);
 		ir_emit_store(proc, _zxcv, ir_emit_struct_ep(proc, _zxcv, gen, 0), real);
@@ -4122,7 +4122,7 @@ irValue *ir_emit_conv(irProcedure *proc, Ast *_zxcv, irValue *value, Type *t) {
 			if (are_types_identical(vt, src_type)) {
 				ir_emit_comment(proc, str_lit("union - child to parent"));
 				gbAllocator a = ir_allocator();
-				irValue *parent = ir_add_local_generated(proc, t);
+				irValue *parent = ir_add_local_generated(proc, _zxcv, t);
 				ir_emit_store_union_variant(proc, _zxcv, parent, value, vt);
 				return ir_emit_load(proc, _zxcv, parent);
 			}
@@ -4206,7 +4206,7 @@ irValue *ir_emit_conv(irProcedure *proc, Ast *_zxcv, irValue *value, Type *t) {
 	}
 	if (is_type_string(src) && is_type_u8_slice(dst)) {
 		irValue *elem = ir_string_elem(proc, _zxcv, value);
-		irValue *elem_ptr = ir_add_local_generated(proc, ir_type(elem));
+		irValue *elem_ptr = ir_add_local_generated(proc, _zxcv, ir_type(elem));
 		ir_emit_store(proc, _zxcv, elem_ptr, elem);
 
 		irValue *len  = ir_string_len(proc, _zxcv, value);
@@ -4217,7 +4217,7 @@ irValue *ir_emit_conv(irProcedure *proc, Ast *_zxcv, irValue *value, Type *t) {
 	if (is_type_array(dst)) {
 		Type *elem = dst->Array.elem;
 		irValue *e = ir_emit_conv(proc, _zxcv, value, elem);
-		irValue *v = ir_add_local_generated(proc, t);
+		irValue *v = ir_add_local_generated(proc, _zxcv, t);
 		isize index_count = cast(isize)dst->Array.count;
 
 		for (i32 i = 0; i < index_count; i++) {
@@ -4228,7 +4228,7 @@ irValue *ir_emit_conv(irProcedure *proc, Ast *_zxcv, irValue *value, Type *t) {
 	}
 
 	if (is_type_any(dst)) {
-		irValue *result = ir_add_local_generated(proc, t_any);
+		irValue *result = ir_add_local_generated(proc, _zxcv, t_any);
 
 		if (is_type_untyped_nil(src)) {
 			return ir_emit_load(proc, _zxcv, result);
@@ -4349,7 +4349,7 @@ irValue *ir_emit_union_cast(irProcedure *proc, Ast *_zxcv, irValue *value, Type 
 		tuple = make_optional_ok_type(type);
 	}
 
-	irValue *v = ir_add_local_generated(proc, tuple);
+	irValue *v = ir_add_local_generated(proc, _zxcv, tuple);
 
 	if (is_ptr) {
 		value = ir_emit_load(proc, _zxcv, value);
@@ -4419,7 +4419,7 @@ irAddr ir_emit_any_cast_addr(irProcedure *proc, Ast *_zxcv, irValue *value, Type
 	}
 	Type *dst_type = tuple->Tuple.variables[0]->type;
 
-	irValue *v = ir_add_local_generated(proc, tuple);
+	irValue *v = ir_add_local_generated(proc, _zxcv, tuple);
 
 	irValue *dst_typeid = ir_typeid(proc->module, dst_type);
 	irValue *any_typeid = ir_emit_struct_ev(proc, _zxcv, value, 1);
@@ -4993,8 +4993,9 @@ void ir_gen_global_type_name(irModule *m, Entity *e, String name) {
 
 
 
-void ir_build_defer_stmt(irProcedure *proc, Ast *_zxcv, irDefer d) {
-	// TODO(lachsinc): ast -> d.stmt
+void ir_build_defer_stmt(irProcedure *proc, irDefer d) {
+	Ast *_zxcv = d.stmt; // TODO(lachsinc): Correct. Cleanup.
+
 	irBlock *b = ir_new_block(proc, nullptr, "defer");
 	// NOTE(bill): The prev block may defer injection before it's terminator
 	irInstr *last_instr = ir_get_last_instr(proc->curr_block);
@@ -5116,7 +5117,7 @@ void ir_init_data_with_defaults(irProcedure *proc, Ast *_zxcv, irValue *ptr, irV
 	Type *elem_type = type_deref(ir_type(ptr));
 	GB_ASSERT(is_type_struct(elem_type) || is_type_array(elem_type));
 
-	irValue *index = ir_add_local_generated(proc, t_int);
+	irValue *index = ir_add_local_generated(proc, _zxcv, t_int);
 	ir_emit_store(proc, _zxcv, index, ir_const_int(0));
 
 	irBlock *loop = nullptr;
@@ -5261,7 +5262,7 @@ irValue *ir_build_builtin_proc(irProcedure *proc, Ast *expr, TypeAndValue tv, Bu
 			return ir_addr_load(proc, _zxcv, addr);
 		}
 		irValue *src = ir_addr_get_ptr(proc, _zxcv, addr);
-		irValue *dst = ir_add_local_generated(proc, tv.type);
+		irValue *dst = ir_add_local_generated(proc, _zxcv, tv.type);
 
 		for (i32 i = 1; i < ce->args.count; i++) {
 			TypeAndValue tv = type_and_value_of_expr(ce->args[i]);
@@ -5284,7 +5285,7 @@ irValue *ir_build_builtin_proc(irProcedure *proc, Ast *expr, TypeAndValue tv, Bu
 		ir_emit_comment(proc, str_lit("complex"));
 		irValue *real = ir_build_expr(proc, _zxcv, ce->args[0]);
 		irValue *imag = ir_build_expr(proc, _zxcv, ce->args[1]);
-		irValue *dst = ir_add_local_generated(proc, tv.type);
+		irValue *dst = ir_add_local_generated(proc, _zxcv, tv.type);
 
 		Type *ft = base_complex_elem_type(tv.type);
 		real = ir_emit_conv(proc, _zxcv, real, ft);
@@ -5317,7 +5318,7 @@ irValue *ir_build_builtin_proc(irProcedure *proc, Ast *expr, TypeAndValue tv, Bu
 		irValue *res = nullptr;
 		Type *t = ir_type(val);
 		if (is_type_complex(t)) {
-			res = ir_add_local_generated(proc, tv.type);
+			res = ir_add_local_generated(proc, _zxcv, tv.type);
 			irValue *real = ir_emit_struct_ev(proc, _zxcv, val, 0);
 			irValue *imag = ir_emit_struct_ev(proc, _zxcv, val, 1);
 			imag = ir_emit_unary_arith(proc, _zxcv, Token_Sub, imag, ir_type(imag));
@@ -5334,7 +5335,7 @@ irValue *ir_build_builtin_proc(irProcedure *proc, Ast *expr, TypeAndValue tv, Bu
 		Type *t = base_type(ir_type(val));
 
 		GB_ASSERT(is_type_tuple(tv.type));
-		irValue *tuple = ir_add_local_generated(proc, tv.type);
+		irValue *tuple = ir_add_local_generated(proc, _zxcv, tv.type);
 		if (t->kind == Type_Struct) {
 			for_array(src_index, t->Struct.fields) {
 				Entity *field = t->Struct.fields[src_index];
@@ -5433,7 +5434,6 @@ irValue *ir_build_expr_internal(irProcedure *proc, Ast *_zxcv, Ast *expr);
 
 irValue *ir_build_expr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 	irValue *v = ir_build_expr_internal(proc, _zxcv, expr);
-	// ir_add_debug_location_to_value(proc, v, expr); // TODO(lachsinc): Cleanup
 	return v;
 }
 
@@ -6022,11 +6022,11 @@ irValue *ir_build_expr_internal(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 				gbAllocator allocator = ir_allocator();
 				Type *slice_type = param_tuple->variables[variadic_index]->type;
 				Type *elem_type  = base_type(slice_type)->Slice.elem;
-				irValue *slice = ir_add_local_generated(proc, slice_type);
+				irValue *slice = ir_add_local_generated(proc, _zxcv, slice_type);
 				isize slice_len = arg_count+1 - (variadic_index+1);
 
 				if (slice_len > 0) {
-					irValue *base_array = ir_add_local_generated(proc, alloc_type_array(elem_type, slice_len));
+					irValue *base_array = ir_add_local_generated(proc, _zxcv, alloc_type_array(elem_type, slice_len));
 
 					for (isize i = variadic_index, j = 0; i < arg_count; i++, j++) {
 						irValue *addr = ir_emit_array_epi(proc, _zxcv, base_array, cast(i32)j);
@@ -6260,7 +6260,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 		Type *t = type_deref(ir_type(e));
 		if (is_type_union(t)) {
 			Type *type = type_of_expr(expr);
-			irValue *v = ir_add_local_generated(proc, type);
+			irValue *v = ir_add_local_generated(proc, _zxcv, type);
 			ir_emit_comment(proc, str_lit("cast - union_cast"));
 			ir_emit_store(proc, _zxcv, v, ir_emit_union_cast(proc, _zxcv, ir_build_expr(proc, _zxcv, ta->expr), type, pos));
 			return ir_addr(v);
@@ -6433,7 +6433,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 			irValue *elem   = ir_emit_ptr_offset(proc, _zxcv, ir_slice_elem(proc, _zxcv, base), low);
 			irValue *new_len = ir_emit_arith(proc, _zxcv, Token_Sub, high, low, t_int);
 
-			irValue *slice = ir_add_local_generated(proc, slice_type);
+			irValue *slice = ir_add_local_generated(proc, _zxcv, slice_type);
 			ir_fill_slice(proc, _zxcv, slice, elem, new_len);
 			return ir_addr(slice);
 		}
@@ -6450,7 +6450,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 			irValue *elem    = ir_emit_ptr_offset(proc, _zxcv, ir_dynamic_array_elem(proc, _zxcv, base), low);
 			irValue *new_len = ir_emit_arith(proc, _zxcv, Token_Sub, high, low, t_int);
 
-			irValue *slice = ir_add_local_generated(proc, slice_type);
+			irValue *slice = ir_add_local_generated(proc, _zxcv, slice_type);
 			ir_fill_slice(proc, _zxcv, slice, elem, new_len);
 			return ir_addr(slice);
 		}
@@ -6471,7 +6471,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 			irValue *elem    = ir_emit_ptr_offset(proc, _zxcv, ir_array_elem(proc, _zxcv, addr), low);
 			irValue *new_len = ir_emit_arith(proc, _zxcv, Token_Sub, high, low, t_int);
 
-			irValue *slice = ir_add_local_generated(proc, slice_type);
+			irValue *slice = ir_add_local_generated(proc, _zxcv, slice_type);
 			ir_fill_slice(proc, _zxcv, slice, elem, new_len);
 			return ir_addr(slice);
 		}
@@ -6487,7 +6487,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 			irValue *elem    = ir_emit_ptr_offset(proc, _zxcv, ir_string_elem(proc, _zxcv, base), low);
 			irValue *new_len = ir_emit_arith(proc, _zxcv, Token_Sub, high, low, t_int);
 
-			irValue *str = ir_add_local_generated(proc, t_string);
+			irValue *str = ir_add_local_generated(proc, _zxcv, t_string);
 			ir_fill_string(proc, _zxcv, str, elem, new_len);
 			return ir_addr(str);
 		}
@@ -6506,7 +6506,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 	case_ast_node(ce, CallExpr, expr);
 		// NOTE(bill): This is make sure you never need to have an 'array_ev'
 		irValue *e = ir_build_expr(proc, _zxcv, expr);
-		irValue *v = ir_add_local_generated(proc, ir_type(e));
+		irValue *v = ir_add_local_generated(proc, _zxcv, ir_type(e));
 		ir_emit_store(proc, _zxcv, v, e);
 		return ir_addr(v);
 	case_end;
@@ -6516,7 +6516,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 		Type *type = type_of_expr(expr);
 		Type *bt = base_type(type);
 
-		irValue *v = ir_add_local_generated(proc, type, true);
+		irValue *v = ir_add_local_generated(proc, _zxcv, type, true);
 
 		Type *et = nullptr;
 		switch (bt->kind) {
@@ -6787,7 +6787,7 @@ irAddr ir_build_addr(irProcedure *proc, Ast *_zxcv, Ast *expr) {
 		default:
 			GB_PANIC("Invalid AST TypeCast");
 		}
-		irValue *v = ir_add_local_generated(proc, type);
+		irValue *v = ir_add_local_generated(proc, _zxcv, type);
 		ir_emit_store(proc, _zxcv, v, e);
 		return ir_addr(v);
 	case_end;
@@ -7078,7 +7078,7 @@ void ir_build_range_indexed(irProcedure *proc, Ast *_zxcv, irValue *expr, Type *
 	irBlock *body = nullptr;
 
 
-	irValue *index = ir_add_local_generated(proc, t_int);
+	irValue *index = ir_add_local_generated(proc, _zxcv, t_int);
 	ir_emit_store(proc, _zxcv, index, ir_const_int(-1));
 
 	loop = ir_new_block(proc, nullptr, "for.index.loop");
@@ -7122,7 +7122,7 @@ void ir_build_range_indexed(irProcedure *proc, Ast *_zxcv, irValue *expr, Type *
 		break;
 	}
 	case Type_Map: {
-		irValue *key = ir_add_local_generated(proc, expr_type->Map.key);
+		irValue *key = ir_add_local_generated(proc, _zxcv, expr_type->Map.key);
 
 		irValue *entries = ir_map_entries_ptr(proc, expr);
 		irValue *elem = ir_emit_struct_ep(proc, _zxcv, entries, 0);
@@ -7177,7 +7177,7 @@ void ir_build_range_string(irProcedure *proc, Ast *_zxcv, irValue *expr, Type *v
 	irBlock *body = nullptr;
 
 
-	irValue *offset_ = ir_add_local_generated(proc, t_int);
+	irValue *offset_ = ir_add_local_generated(proc, _zxcv, t_int);
 	ir_emit_store(proc, _zxcv, offset_, v_zero);
 
 	loop = ir_new_block(proc, nullptr, "for.string.loop");
@@ -7233,10 +7233,10 @@ void ir_build_range_interval(irProcedure *proc, Ast *_zxcv, AstBinaryExpr *node,
 	if (val_type == nullptr) {
 		val_type = ir_type(lower);
 	}
-	irValue *value = ir_add_local_generated(proc, val_type);
+	irValue *value = ir_add_local_generated(proc, _zxcv, val_type);
 	ir_emit_store(proc, _zxcv, value, lower);
 
-	irValue *index = ir_add_local_generated(proc, t_int);
+	irValue *index = ir_add_local_generated(proc, _zxcv, t_int);
 	ir_emit_store(proc, _zxcv, index, ir_const_int(0));
 
 	loop = ir_new_block(proc, nullptr, "for.interval.loop");
@@ -7289,7 +7289,7 @@ void ir_build_range_enum(irProcedure *proc, Ast *_zxcv, Type *enum_type, Type *v
 	irValue *values      = ir_emit_load(proc, _zxcv, ir_emit_struct_ep(proc, _zxcv, eti_ptr, 2));
 	irValue *values_data = ir_slice_elem(proc, _zxcv, values);
 
-	irValue *offset_ = ir_add_local_generated(proc, t_int);
+	irValue *offset_ = ir_add_local_generated(proc, _zxcv, t_int);
 	ir_emit_store(proc, _zxcv, offset_, v_zero);
 
 	irBlock *loop = ir_new_block(proc, nullptr, "for.enum.loop");
@@ -7325,11 +7325,11 @@ void ir_build_range_enum(irProcedure *proc, Ast *_zxcv, Type *enum_type, Type *v
 	if (done_) *done_ = done;
 }
 
-void ir_store_type_case_implicit(irProcedure *proc, Ast *clause, irValue *value) {
+void ir_store_type_case_implicit(irProcedure *proc, Ast *_zxcv, Ast *clause, irValue *value) {
+	// TODO(lachsinc): _zxcv needed ??
 	Entity *e = implicit_entity_of_node(clause);
 	GB_ASSERT(e != nullptr);
-	irValue *x = ir_add_local(proc, e, nullptr, false);
-	Ast *_zxcv = clause;
+	irValue *x = ir_add_local(proc, _zxcv, e, nullptr, false);
 	ir_emit_store(proc, _zxcv, x, value);
 }
 
@@ -7370,7 +7370,7 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 				for_array(i, vd->names) {
 					Ast *name = vd->names[i];
 					if (!is_blank_ident(name)) {
-						ir_add_local_for_identifier(proc, name, true);
+						ir_add_local_for_identifier(proc, _zxcv, name, true);
 					}
 				}
 			} else { // Tuple(s)
@@ -7381,7 +7381,7 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 					Ast *name = vd->names[i];
 					irAddr lval = ir_addr(nullptr);
 					if (!is_blank_ident(name)) {
-						ir_add_local_for_identifier(proc, name, false);
+						ir_add_local_for_identifier(proc, _zxcv, name, false);
 						lval = ir_build_addr(proc, _zxcv, name);
 					}
 					array_add(&lvals, lval);
@@ -7557,7 +7557,7 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 			GB_ASSERT(results.count == return_count);
 
 			Type *ret_type = proc->type->Proc.results;
-			v = ir_add_local_generated(proc, ret_type);
+			v = ir_add_local_generated(proc, _zxcv, ret_type);
 			for_array(i, results) {
 				Entity *e = tuple->variables[i];
 				irValue *res = ir_emit_conv(proc, _zxcv, results[i], e->type);
@@ -7676,10 +7676,10 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 		}
 
 		if (val0_type != nullptr) {
-			ir_add_local_for_identifier(proc, rs->val0, true);
+			ir_add_local_for_identifier(proc, _zxcv, rs->val0, true);
 		}
 		if (val1_type != nullptr) {
-			ir_add_local_for_identifier(proc, rs->val1, true);
+			ir_add_local_for_identifier(proc, _zxcv, rs->val1, true);
 		}
 
 		irValue *val = nullptr;
@@ -7718,7 +7718,7 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 				if (is_type_pointer(type_deref(ir_type(array)))) {
 					array = ir_emit_load(proc, _zxcv, array);
 				}
-				count_ptr = ir_add_local_generated(proc, t_int);
+				count_ptr = ir_add_local_generated(proc, _zxcv, t_int);
 				ir_emit_store(proc, _zxcv, count_ptr, ir_const_int(et->Array.count));
 				ir_build_range_indexed(proc, _zxcv, array, val0_type, count_ptr, &val, &key, &loop, &done);
 				break;
@@ -7740,7 +7740,7 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 					count_ptr = ir_emit_struct_ep(proc, _zxcv, slice, 1);
 					slice = ir_emit_load(proc, _zxcv, slice);
 				} else {
-					count_ptr = ir_add_local_generated(proc, t_int);
+					count_ptr = ir_add_local_generated(proc, _zxcv, t_int);
 					ir_emit_store(proc, _zxcv, count_ptr, ir_slice_len(proc, _zxcv, slice));
 				}
 				ir_build_range_indexed(proc, _zxcv, slice, val0_type, count_ptr, &val, &key, &loop, &done);
@@ -7752,7 +7752,7 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 					string = ir_emit_load(proc, _zxcv, string);
 				}
 				if (is_type_untyped(expr_type)) {
-					irValue *s = ir_add_local_generated(proc, default_type(ir_type(string)));
+					irValue *s = ir_add_local_generated(proc, _zxcv, default_type(ir_type(string)));
 					ir_emit_store(proc, _zxcv, s, string);
 					string = ir_emit_load(proc, _zxcv, s);
 				}
@@ -7996,13 +7996,13 @@ void ir_build_stmt_internal(irProcedure *proc, Ast *node) {
 				}
 			}
 
-			ir_store_type_case_implicit(proc, clause, value);
+			ir_store_type_case_implicit(proc, _zxcv, clause, value);
 			ir_type_case_body(proc, ss->label, clause, body, done);
 			ir_start_block(proc, next);
 		}
 
 		if (default_ != nullptr) {
-			ir_store_type_case_implicit(proc, default_, parent_value);
+			ir_store_type_case_implicit(proc, _zxcv, default_, parent_value);
 			ir_type_case_body(proc, ss->label, default_, proc->curr_block, done);
 		} else {
 			ir_emit_jump(proc, done);
@@ -8176,7 +8176,8 @@ void ir_begin_procedure_body(irProcedure *proc) {
 
 			if (e->token.string != "") {
 				GB_ASSERT(!is_blank_ident(e->token));
-				irValue *res = ir_add_local(proc, e, e->identifier, true);
+				Ast *_zxcv = e->identifier; // TODO(lachsinc): Confirm correct.
+				irValue *res = ir_add_local(proc, _zxcv, e, e->identifier, true);
 
 				irValue *c = nullptr;
 				switch (e->Variable.param_value.kind) {
@@ -9521,15 +9522,17 @@ void ir_gen_tree(irGen *s) {
 		ir_begin_procedure_body(proc);
 		defer (ir_end_procedure_body(proc));
 
-		Ast *_zxcv = e->identifier; // TODO(lachsinc): Confirm correct.
-		ir_emit_init_context(proc, _zxcv);
+		// TODO(lachsinc): Do we _need_ debug location information? Can we look up the entry point
+		// somehow ??
+		ir_emit_init_context(proc, nullptr);
 
-		ir_setup_type_info_data(proc, _zxcv);
+		ir_setup_type_info_data(proc, nullptr);
 
 
 		for_array(i, global_variables) {
 			irGlobalVariable *var = &global_variables[i];
-			if (var->decl->init_expr != nullptr)  {
+			Ast *_zxcv = var->decl->init_expr; // TODO(lachsinc): Cleanup.
+			if (var->decl->init_expr != nullptr) {
 				var->init = ir_build_expr(proc, _zxcv, var->decl->init_expr);
 			}
 
@@ -9564,7 +9567,6 @@ void ir_gen_tree(irGen *s) {
 
 	for_array(i, m->procs_to_generate) {
 		irValue *p = m->procs_to_generate[i];
-		// Ast *_zxcv = p->Proc.entity->identifier; // TODO(lachsinc): Confirm correct.
 		ir_build_proc(p, p->Proc.parent);
 	}
 
